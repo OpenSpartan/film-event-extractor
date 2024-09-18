@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Den.Dev.Orion" Version="1.0.58" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.64.1" />
+    <PackageReference Include="Microsoft.Identity.Client.Extensions.Msal" Version="4.64.1" />
+  </ItemGroup>
+
+</Project>
