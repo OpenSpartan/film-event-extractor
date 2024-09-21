@@ -5,6 +5,7 @@ using Den.Dev.Orion.Models.HaloInfinite;
 using Den.Dev.Orion.Models.Security;
 using Microsoft.Identity.Client;
 using Microsoft.Identity.Client.Extensions.Msal;
+using OpenSpartan.FilmEventExtractor.Models;
 using System;
 using System.Collections.Concurrent;
 using System.IO.Compression;
@@ -49,32 +50,45 @@ namespace OpenSpartan.FilmEventExtractor
                         var filmMetadata = await SafeAPICall(async () => await HaloClient.HIUGCDiscoverySpectateByMatchId(matchId.ToString()));
                         if (filmMetadata != null && filmMetadata.Result != null)
                         {
-                            // Individual chunks contain player information that we do not have anywhere else. Let's try and parse it out.
-                            var playerTagChunk = filmMetadata.Result.CustomData.Chunks.First(x => x.ChunkType == 1);
+                            // Individual chunks contain player information that we do not have anywhere else - gamertag and XUID combos.
+                            // This data is available in all chunks but the final, so we will try and parse it out.
+                            var playerTagChunks = filmMetadata.Result.CustomData.Chunks.Where(x => x.ChunkType != 3);
 
                             // General metadata chunk always has chunk type of 3.
                             var generalMetadataChunk = filmMetadata.Result.CustomData.Chunks.First(x => x.ChunkType == 3);
 
-                            if (playerTagChunk != null && generalMetadataChunk != null)
+                            if (playerTagChunks != null && generalMetadataChunk != null)
                             {
-                                Console.WriteLine($"Processing {playerTagChunk.FileRelativePath} for {matchId}...");
+                                Dictionary<long,string> metaPlayerCollection = new Dictionary<long, string>();
 
-                                var url = $"{filmMetadata.Result.BlobStoragePathPrefix}{playerTagChunk.FileRelativePath.Replace("/", string.Empty)}";
-                                Console.WriteLine($"Downloading film chunk from {url}");
-
-                                var compressedPlayerData = await DownloadFilm(url);
-                                var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
-
-                                var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
-                                foreach (var player in players)
+                                foreach (var playerTagChunk in playerTagChunks)
                                 {
-                                    Console.WriteLine($"{player.Key} - {player.Value}");
+                                    Console.WriteLine($"Processing {playerTagChunk.FileRelativePath} for {matchId}...");
+
+                                    var url = $"{filmMetadata.Result.BlobStoragePathPrefix}{playerTagChunk.FileRelativePath.Replace("/", string.Empty)}";
+                                    Console.WriteLine($"Downloading film chunk from {url}");
+
+                                    var compressedPlayerData = await DownloadFilm(url);
+                                    var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
+
+                                    var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
+
+                                    foreach (var player in players)
+                                    {
+                                        metaPlayerCollection.TryAdd(player.Key, player.Value);
+                                    }
+                                }
+
+                                Console.WriteLine("Finished processing individual starter chunks. Identified players:");
+                                foreach (var player in metaPlayerCollection)
+                                {
+                                    Console.WriteLine($"{player.Value} ({player.Key})");
                                 }
 
                                 var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
                                 var uncompressedMetadata = UncompressZlib(compressedMetadata);
 
-                                foreach (var player in players)
+                                foreach (var player in metaPlayerCollection)
                                 {
                                     Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", InsertZeroBytes(Encoding.UTF8.GetBytes(player.Value)).Select(b => b.ToString("X2")))})...");
                                     //var searchPattern = InsertZeroBytes(Encoding.UTF8.GetBytes(player.Value));
@@ -464,7 +478,7 @@ namespace OpenSpartan.FilmEventExtractor
             extractedData[byteCount - 1] = (byte)(data[startByteOffset + byteCount - 1] << startBitShift);
 
             // Mask the last byte to only include bits up to endBitShift
-            extractedData[byteCount - 1] &= (byte)(0xFF << (8 - endBitShift));
+            extractedData[byteCount - 1] &= (byte)(0xFF << (7 - endBitShift));
 
             return extractedData;
         }
@@ -543,12 +557,21 @@ namespace OpenSpartan.FilmEventExtractor
             return BitConverter.ToInt64(byteArray, startIndex);
         }
 
-        public static Dictionary<long, string> ProcessFilmTimelineData(byte[] data, byte[] pattern)
+        public static List<GameEvent> ProcessFilmTimelineData(byte[] data, byte[] pattern)
         {
             List<int> patternPositions = FindPatternPositions(data, pattern);
             foreach (var patternPosition in patternPositions)
             {
                 Console.WriteLine(patternPosition.ToString());
+
+                // A whole game event is 60 bytes, let's extract it.
+                var eventBinaryContent = ExtractBitsFromPosition(data, patternPosition, 60 * 8);
+
+                var gameEvent = ParseGameEvent(eventBinaryContent);
+                if (gameEvent != null)
+                {
+                    Console.WriteLine($"{gameEvent.Gamertag} {gameEvent.TypeHint} {gameEvent.Timestamp} {gameEvent.IsMedal} {gameEvent.MedalType}");
+                }
             }
             //Dictionary<long, string> players = [];
 
@@ -668,6 +691,33 @@ namespace OpenSpartan.FilmEventExtractor
             }
 
             return true;
+        }
+
+        public static GameEvent ParseGameEvent(byte[] data)
+        {
+            var gameEvent = new GameEvent();
+
+            // Extract the 16-character UTF-16 gamertag (32 bytes)
+            byte[] gamertagBytes = ExtractBitsFromPosition(data, 0, 32 * 8); // 32 bytes
+            gameEvent.Gamertag = System.Text.Encoding.Unicode.GetString(gamertagBytes).Trim('\0');
+
+            // Extract the type hint (1 byte)
+            byte typeHint = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8, 1 * 8)[0]; // 120 bytes of padding + 1 byte
+            gameEvent.TypeHint = typeHint;
+
+            // Extract the timestamp (4 bytes)
+            byte[] timestampBytes = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8, 4 * 8); // 120 bytes of padding + 1 byte + 4 bytes
+            gameEvent.Timestamp = BitConverter.ToUInt32(timestampBytes, 0);
+
+            // Extract the is medal (1 byte)
+            byte isMedal = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8 + 4 * 8 + 24 * 8, 1 * 8)[0]; // 120 bytes + 1 byte + 4 bytes + 24 bytes
+            gameEvent.IsMedal = isMedal;
+
+            // Extract the medal type (1 byte)
+            byte medalType = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8 + 4 * 8 + 24 * 8 + 8, 1 * 8)[0]; // 120 bytes + 1 byte + 4 bytes + 24 bytes + 8 bytes
+            gameEvent.MedalType = medalType;
+
+            return gameEvent;
         }
     }
 }
