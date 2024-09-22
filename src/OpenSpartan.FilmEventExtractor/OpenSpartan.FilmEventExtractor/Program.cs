@@ -3,12 +3,15 @@ using Den.Dev.Orion.Core;
 using Den.Dev.Orion.Models;
 using Den.Dev.Orion.Models.HaloInfinite;
 using Den.Dev.Orion.Models.Security;
+using Microsoft.Data.Sqlite;
 using Microsoft.Identity.Client;
 using Microsoft.Identity.Client.Extensions.Msal;
 using OpenSpartan.FilmEventExtractor.Models;
-using System;
+using OpenSpartan.FilmEventExtractor.Terminal;
 using System.Collections.Concurrent;
 using System.IO.Compression;
+using System.Net;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace OpenSpartan.FilmEventExtractor
@@ -21,6 +24,8 @@ namespace OpenSpartan.FilmEventExtractor
         internal static readonly string HaloInfiniteAPIRelease = "1.8";
         internal static readonly string ApplicationName = "OpenSpartan.FilmEventExtractor";
         internal static readonly string ApplicationVersion = "0.0.1-09172024";
+        internal static readonly string DataConnectionString = @"Data Source=eventlog.db;";
+        internal static readonly string LogFileName = "log.txt";
 
         internal static readonly byte[] PlayerIdentificationPattern = { 0x2D, 0xC0 };
 
@@ -32,6 +37,8 @@ namespace OpenSpartan.FilmEventExtractor
 
         static async Task Main(string[] args)
         {
+            InitializeLogging();
+
             Console.WriteLine($"{ApplicationName} ({ApplicationVersion})");
             Console.WriteLine("Authenticating...");
             var authResult = await InitializeApplication();
@@ -42,11 +49,19 @@ namespace OpenSpartan.FilmEventExtractor
 
                 var matchIds = await GetPlayerMatchIds(XboxUserContext.DisplayClaims.Xui[0].XUID);
 
+                // Prepare the database.
+                SetWALJournalingMode();
+
+                using SqliteConnection connection = new SqliteConnection(DataConnectionString);
+                connection.Open();
+
                 if (matchIds != null && matchIds.Count > 0)
                 {
                     // We have matches - let's get the films for each.
                     foreach (var matchId in matchIds)
                     {
+                        Console.WriteLine($"Processing match {matchIds.IndexOf(matchId)} of {matchIds.Count}...");
+
                         var filmMetadata = await SafeAPICall(async () => await HaloClient.HIUGCDiscoverySpectateByMatchId(matchId.ToString()));
                         if (filmMetadata != null && filmMetadata.Result != null)
                         {
@@ -59,7 +74,7 @@ namespace OpenSpartan.FilmEventExtractor
 
                             if (playerTagChunks != null && generalMetadataChunk != null)
                             {
-                                Dictionary<long,string> metaPlayerCollection = new Dictionary<long, string>();
+                                Dictionary<long, string> metaPlayerCollection = [];
 
                                 foreach (var playerTagChunk in playerTagChunks)
                                 {
@@ -69,13 +84,20 @@ namespace OpenSpartan.FilmEventExtractor
                                     Console.WriteLine($"Downloading film chunk from {url}");
 
                                     var compressedPlayerData = await DownloadFilm(url);
-                                    var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
-
-                                    var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
-
-                                    foreach (var player in players)
+                                    if (compressedPlayerData != null)
                                     {
-                                        metaPlayerCollection.TryAdd(player.Key, player.Value);
+                                        var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
+
+                                        var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
+
+                                        foreach (var player in players)
+                                        {
+                                            metaPlayerCollection.TryAdd(player.Key, player.Value);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("Content is null.");
                                     }
                                 }
 
@@ -86,23 +108,61 @@ namespace OpenSpartan.FilmEventExtractor
                                 }
 
                                 var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
-                                var uncompressedMetadata = UncompressZlib(compressedMetadata);
 
-                                foreach (var player in metaPlayerCollection)
+                                if (compressedMetadata != null)
                                 {
-                                    Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", InsertZeroBytes(Encoding.UTF8.GetBytes(player.Value)).Select(b => b.ToString("X2")))})...");
-                                    //var searchPattern = InsertZeroBytes(Encoding.UTF8.GetBytes(player.Value));
-                                    var data = ProcessFilmTimelineData(uncompressedMetadata, InsertZeroBytes(Encoding.UTF8.GetBytes(player.Value)));
+                                    var uncompressedMetadata = UncompressZlib(compressedMetadata);
+
+                                    foreach (var player in metaPlayerCollection)
+                                    {
+                                        Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", Encoding.Unicode.GetBytes(player.Value).Select(b => b.ToString("X2")))})...");
+                                        var data = ProcessFilmTimelineData(uncompressedMetadata, Encoding.Unicode.GetBytes(player.Value));
+
+                                        if (data != null && data.Count > 0)
+                                        {
+                                            string query = @"INSERT INTO EventLog (EventID, MatchID, Gamertag, XUID, EventType, MedalFlag, EventTime, MetadataValue)
+                                                             VALUES (@EventID, @MatchID, @Gamertag, @XUID, @EventType, @MedalFlag, @EventTime, @MetadataValue)";
+
+                                            foreach (var gameEvent in data)
+                                            {
+                                                // Create a command object
+                                                using SqliteCommand command = new(query, connection);
+                                                // Add parameters to the query
+                                                command.Parameters.AddWithValue("@EventID", Guid.NewGuid().ToString());         // Event ID (Primary Key)
+                                                command.Parameters.AddWithValue("@MatchID", matchId);         // Match ID
+                                                command.Parameters.AddWithValue("@Gamertag", gameEvent.Gamertag);       // Gamertag
+                                                command.Parameters.AddWithValue("@XUID", player.Key);    // XUID
+                                                command.Parameters.AddWithValue("@EventType", gameEvent.TypeHint);           // Event Type
+                                                command.Parameters.AddWithValue("@MedalFlag", gameEvent.IsMedal);                // Medal Flag (Integer)
+                                                command.Parameters.AddWithValue("@EventTime", gameEvent.Timestamp);       // Event Time (Unix timestamp)
+                                                command.Parameters.AddWithValue("@MetadataValue", gameEvent.MedalType);  // Optional Metadata Value
+
+                                                try
+                                                {
+                                                    // Execute the command
+                                                    int result = command.ExecuteNonQuery();
+
+                                                    // Output the result
+                                                    Console.WriteLine($"{result} row(s) inserted into database.");
+                                                }
+                                                catch (Exception ex)
+                                                {
+                                                    Console.WriteLine("Could not insert data into database.");
+                                                    Console.WriteLine(ex.ToString());
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                //if (compressedPlayerData != null && compressedMetadata != null)
-                                //{
-                                //    Console.WriteLine($"We have both required chunks for {matchId}. Processing...");
-                                //}
+                                else
+                                {
+                                    Console.WriteLine("Content is null.");
+                                }
                             }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Could not get film metadata for match {matchId}");
+                            else
+                            {
+                                Console.WriteLine($"Could not get film metadata for match {matchId}");
+                            }
                         }
                     }
                 }
@@ -114,27 +174,42 @@ namespace OpenSpartan.FilmEventExtractor
             }
         }
 
-        public static byte[] InsertZeroBytes(byte[] data)
+        static void InitializeLogging()
         {
-            // Define zero byte to insert
-            byte zeroByte = 0x00;
-
-            // Calculate the length of the new byte array
-            int newSize = data.Length * 2 - 1;
-            byte[] result = new byte[newSize];
-
-            // Insert characters and zero bytes
-            int resultIndex = 0;
-            for (int i = 0; i < data.Length; i++)
+            StreamWriter logFileWriter = new(LogFileName, append: false)
             {
-                result[resultIndex++] = data[i];
-                if (i < data.Length - 1) // Avoid appending zero byte after the last character
+                AutoFlush = true
+            };
+
+            MultiTextWriter multiWriter = new(Console.Out, logFileWriter);
+
+            Console.SetOut(multiWriter);
+        }
+
+        internal static string SetWALJournalingMode()
+        {
+            try
+            {
+                using var connection = new SqliteConnection(DataConnectionString);
+                connection.Open();
+
+                using var command = connection.CreateCommand();
+                command.CommandText = "PRAGMA journal_mode=WAL;";
+
+                using var reader = command.ExecuteReader();
+                if (reader.Read())
                 {
-                    result[resultIndex++] = zeroByte;
+                    return reader.GetString(0).Trim();
                 }
+
+                Console.WriteLine($"WAL journaling mode not set.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Journaling mode modification exception: {ex.Message}");
             }
 
-            return result;
+            return null;
         }
 
         static byte[] UncompressZlib(byte[] compressedData)
@@ -151,25 +226,51 @@ namespace OpenSpartan.FilmEventExtractor
 
         private static async Task<byte[]?> DownloadFilm(string filmPath)
         {
-            using (HttpClient client = new())
+            using HttpClient client = new();
+            // Add custom headers
+            client.DefaultRequestHeaders.Add("X-343-Authorization-Spartan", HaloClient.SpartanToken);
+            client.DefaultRequestHeaders.Add("343-clearance", HaloClient.ClearanceToken);
+
+            try
             {
-                // Add custom headers
-                client.DefaultRequestHeaders.Add("X-343-Authorization-Spartan", HaloClient.SpartanToken);
-                client.DefaultRequestHeaders.Add("343-clearance", HaloClient.ClearanceToken);
+                // Attempt to download byte array from the URL
+                byte[] data = await client.GetByteArrayAsync(filmPath);
+                Console.WriteLine($"Downloaded {data.Length} chunk bytes successfully for {filmPath}.");
+                return data;
+            }
+            catch (HttpRequestException e) when (e.StatusCode != HttpStatusCode.OK)
+            {
+                // Handle cases where the request is not successful. At this point, we're not super-picky
+                // Let's just re-initialize the application and try to get the data again.
+                Console.WriteLine($"Unauthorized request for {filmPath}: {e.Message}. Initializing application...");
+                bool appState = await InitializeApplication(); // Call your initialization function
 
-                try
+                if (appState)
                 {
-                    // Download byte array from the URL
-                    byte[] data = await client.GetByteArrayAsync(filmPath);
-                    Console.WriteLine($"Downloaded {data.Length} chunk bytes successfully for {filmPath}.");
-
-                    return data;
+                    // Retry the download
+                    try
+                    {
+                        byte[] data = await client.GetByteArrayAsync(filmPath);
+                        Console.WriteLine($"Downloaded {data.Length} chunk bytes successfully for {filmPath} after reinitialization.");
+                        return data;
+                    }
+                    catch (HttpRequestException retryException)
+                    {
+                        Console.WriteLine($"Retry failed for {filmPath}: {retryException.Message}");
+                        return null;
+                    }
                 }
-                catch (HttpRequestException e)
+                else
                 {
-                    Console.WriteLine($"Request error for {filmPath}: {e.Message}");
+                    Console.WriteLine("Could not re-initialize the application.");
                     return null;
                 }
+            }
+            catch (HttpRequestException e)
+            {
+                // Handle other request errors
+                Console.WriteLine($"Request error for {filmPath}: {e.Message}");
+                return null;
             }
         }
 
@@ -184,6 +285,7 @@ namespace OpenSpartan.FilmEventExtractor
             // threshold for successful matches is not hit.
             while (true)
             {
+
                 tasks.Add(GetMatchBatchAsync(xuid, queryStart, MatchesPerPage));
 
                 queryStart += MatchesPerPage;
@@ -434,7 +536,7 @@ namespace OpenSpartan.FilmEventExtractor
             return matchPositions;
         }
 
-        public static byte[] ExtractBitsFromPosition(byte[] data, int startBitPosition, int bitLength)
+        public static byte[] ExtractBitsFromPosition(byte[] data, int startBitPosition, int bitLength, [CallerMemberName] string caller = "")
         {
             // Calculate the actual end bit position
             int endBitPosition = startBitPosition + bitLength - 1;
@@ -442,7 +544,9 @@ namespace OpenSpartan.FilmEventExtractor
             // Validate input parameters
             if (startBitPosition < 0 || endBitPosition < 0 || startBitPosition >= data.Length * 8 || endBitPosition >= data.Length * 8 || startBitPosition > endBitPosition)
             {
-                throw new ArgumentOutOfRangeException("Bit positions are out of range or invalid.");
+                //throw new ArgumentOutOfRangeException("Bit positions are out of range or invalid.");
+                Console.WriteLine($"[ERROR] Could not get the bits from position {startBitPosition} to bit length {bitLength}. Data length: {data.Length}. Caller: {caller}");
+                return null;
             }
 
             // Calculate the byte offset and bit shift for the start position
@@ -456,15 +560,7 @@ namespace OpenSpartan.FilmEventExtractor
             // Calculate the number of bytes to extract
             int byteCount = endByteOffset - startByteOffset + 1;
 
-            // If there's no bit shift, we can return from the byte offset onward
-            if (startBitShift == 0 && endBitShift == 0)
-            {
-                byte[] result = new byte[byteCount];
-                Array.Copy(data, startByteOffset, result, 0, byteCount);
-                return result;
-            }
-
-            // Otherwise, we need to shift the bits manually
+            // Allocate the result array
             byte[] extractedData = new byte[byteCount];
 
             // Go byte by byte, shift and copy
@@ -478,7 +574,7 @@ namespace OpenSpartan.FilmEventExtractor
             extractedData[byteCount - 1] = (byte)(data[startByteOffset + byteCount - 1] << startBitShift);
 
             // Mask the last byte to only include bits up to endBitShift
-            extractedData[byteCount - 1] &= (byte)(0xFF << (7 - endBitShift));
+            extractedData[byteCount - 1] &= (byte)(0xFF << (7 - endBitShift) >> (7 - endBitShift));
 
             return extractedData;
         }
@@ -534,20 +630,58 @@ namespace OpenSpartan.FilmEventExtractor
 
         public static string ConvertBytesToText(byte[] byteArray)
         {
-            if (byteArray == null)
+            ArgumentNullException.ThrowIfNull(byteArray);
+
+            if (byteArray.Length == 0)
             {
-                throw new ArgumentNullException(nameof(byteArray));
+                return string.Empty; // Return an empty string for an empty array.
             }
 
-            return Encoding.UTF8.GetString(byteArray);
+            // Step 1: Trim trailing double 0x00 bytes
+            int endIndex = byteArray.Length;
+            while (endIndex > 1 && byteArray[endIndex - 1] == 0x00 && byteArray[endIndex - 2] == 0x00)
+            {
+                endIndex -= 1;
+            }
+
+            // Step 2: Trim leading 0x00 bytes
+            int startIndex = 0;
+            while (startIndex < endIndex && byteArray[startIndex] == 0x00)
+            {
+                startIndex++;
+            }
+
+            // Step 3: Extract the remaining bytes
+            int remainingLength = endIndex - startIndex;
+            if (remainingLength % 2 != 0)
+            {
+                throw new ArgumentException("Byte array length must be even for UTF-16 encoding.");
+            }
+
+            byte[] trimmedBytes = new byte[remainingLength];
+            Array.Copy(byteArray, startIndex, trimmedBytes, 0, remainingLength);
+
+            // Step 4: Convert to string
+            string result = Encoding.Unicode.GetString(trimmedBytes);
+
+            // Step 5: Trim trailing null characters (0x00)
+            result = result.TrimEnd('\0');
+
+            // Step 6: Ensure only one trailing null character if there were two in the original byte array
+            if (remainingLength > 0 && endIndex - startIndex > 0 && byteArray[endIndex - 1] == 0x00 && byteArray[endIndex - 2] == 0x00)
+            {
+                if (result.EndsWith("\0"))
+                {
+                    result = result.Substring(0, result.Length - 1);
+                }
+            }
+
+            return result;
         }
 
         public static long ConvertBytesToInt64(byte[] byteArray, int startIndex = 0)
         {
-            if (byteArray == null)
-            {
-                throw new ArgumentNullException(nameof(byteArray));
-            }
+            ArgumentNullException.ThrowIfNull(byteArray);
 
             if (byteArray.Length < startIndex + 8)
             {
@@ -559,60 +693,29 @@ namespace OpenSpartan.FilmEventExtractor
 
         public static List<GameEvent> ProcessFilmTimelineData(byte[] data, byte[] pattern)
         {
+            List<GameEvent> events = [];
+
             List<int> patternPositions = FindPatternPositions(data, pattern);
             foreach (var patternPosition in patternPositions)
             {
-                Console.WriteLine(patternPosition.ToString());
-
                 // A whole game event is 60 bytes, let's extract it.
                 var eventBinaryContent = ExtractBitsFromPosition(data, patternPosition, 60 * 8);
 
-                var gameEvent = ParseGameEvent(eventBinaryContent);
-                if (gameEvent != null)
+                if (eventBinaryContent != null)
                 {
-                    Console.WriteLine($"{gameEvent.Gamertag} {gameEvent.TypeHint} {gameEvent.Timestamp} {gameEvent.IsMedal} {gameEvent.MedalType}");
+                    var gameEvent = ParseGameEvent(eventBinaryContent);
+                    if (gameEvent != null)
+                    {
+                        events.Add(gameEvent);
+                    }
                 }
-            }
-            //Dictionary<long, string> players = [];
-
-            //foreach (int patternPosition in patternPositions)
-            //{
-            //    int xuidStartPosition = patternPosition - 8 * 8;
-            //    byte[] xuid = ExtractBitsFromPosition(data, xuidStartPosition, 8 * 8);
-
-            //    int prePatternPosition = xuidStartPosition - 22 * 8;
-            //    var bytePrefixValidated = AreAllBytesZero(data, prePatternPosition, 22);
-
-            //    if (bytePrefixValidated)
-            //    {
-            //        byte[] gamertagData = ExtractBitsFromPosition(data, prePatternPosition - 32 * 8, 32 * 8);
-
-            //        players.TryAdd(ConvertBytesToInt64(xuid), ConvertBytesToText(gamertagData));
-            //    }
-            //}
-
-            return null;
-        }
-        static byte[] RemoveZeroBytes(byte[] inputArray)
-        {
-            // Create a temporary array to store non-zero bytes
-            byte[] tempArray = new byte[inputArray.Length];
-            int count = 0;
-
-            // Copy non-zero bytes to the temporary array
-            foreach (byte b in inputArray)
-            {
-                if (b != 0)
+                else
                 {
-                    tempArray[count++] = b;
+                    Console.WriteLine("[ERROR] Event binary content is null.");
                 }
             }
 
-            // Create the final array with the correct size
-            byte[] resultArray = new byte[count];
-            Array.Copy(tempArray, 0, resultArray, 0, count);
-
-            return resultArray;
+            return events;
         }
 
         public static Dictionary<long, string> ProcessFilmBootstrapData(byte[] data, byte[] pattern)
@@ -624,21 +727,44 @@ namespace OpenSpartan.FilmEventExtractor
             foreach (int patternPosition in patternPositions)
             {
                 int xuidStartPosition = patternPosition - 8 * 8;
+                Console.WriteLine($"XUID start position: {xuidStartPosition}");
+
                 byte[] xuid = ExtractBitsFromPosition(data, xuidStartPosition, 8 * 8);
-                var convertedXuid = ConvertBytesToInt64(xuid);
 
-                // We make sure that XUIDs are not some weird values.
-                if (convertedXuid > 0)
+                if (xuid != null)
                 {
-                    int prePatternPosition = xuidStartPosition - 22 * 8;
-                    var bytePrefixValidated = AreAllBytesZero(data, prePatternPosition, 22 * 8);
+                    var convertedXuid = ConvertBytesToInt64(xuid);
 
-                    if (bytePrefixValidated)
+                    // We make sure that XUIDs are not some weird values.
+                    if (convertedXuid > 0)
                     {
-                        byte[] gamertagData = RemoveZeroBytes(ExtractBitsFromPosition(data, prePatternPosition - 32 * 8, 32 * 8));
+                        int prePatternPosition = xuidStartPosition - 21 * 8;
+                        var bytePrefixValidated = AreAllBytesZero(data, prePatternPosition, 21 * 8);
 
-                        players.TryAdd(ConvertBytesToInt64(xuid), ConvertBytesToText(gamertagData));
+                        if (bytePrefixValidated)
+                        {
+                            Console.WriteLine($"Gamertag extraction position: {prePatternPosition - 32 * 8}");
+                            byte[] gamertagData = ExtractBitsFromPosition(data, prePatternPosition - 32 * 8, 32 * 8);
+
+                            if (gamertagData != null)
+                            {
+                                var gamertag = ConvertBytesToText(gamertagData);
+
+                                if (gamertag != null && !string.IsNullOrWhiteSpace(gamertag))
+                                {
+                                    players.TryAdd(ConvertBytesToInt64(xuid), gamertag);
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine("[ERROR] Gamertag data is null.");
+                            }
+                        }
                     }
+                }
+                else
+                {
+                    Console.WriteLine("[ERROR] XUID data is null.");
                 }
             }
 
@@ -698,26 +824,53 @@ namespace OpenSpartan.FilmEventExtractor
             var gameEvent = new GameEvent();
 
             // Extract the 16-character UTF-16 gamertag (32 bytes)
-            byte[] gamertagBytes = ExtractBitsFromPosition(data, 0, 32 * 8); // 32 bytes
-            gameEvent.Gamertag = System.Text.Encoding.Unicode.GetString(gamertagBytes).Trim('\0');
+            byte[] gamertagBytes = ExtractBitsFromPosition(data, 0, 32 * 8);
 
-            // Extract the type hint (1 byte)
-            byte typeHint = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8, 1 * 8)[0]; // 120 bytes of padding + 1 byte
-            gameEvent.TypeHint = typeHint;
+            if (gamertagBytes != null)
+            {
+                gameEvent.Gamertag = Encoding.Unicode.GetString(gamertagBytes).Trim('\0');
 
-            // Extract the timestamp (4 bytes)
-            byte[] timestampBytes = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8, 4 * 8); // 120 bytes of padding + 1 byte + 4 bytes
-            gameEvent.Timestamp = BitConverter.ToUInt32(timestampBytes, 0);
+                // Extract the type hint (1 byte)
+                byte typeHint = ExtractBitsFromPosition(data, 32 * 8 + 15 * 8, 8)[0];
 
-            // Extract the is medal (1 byte)
-            byte isMedal = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8 + 4 * 8 + 24 * 8, 1 * 8)[0]; // 120 bytes + 1 byte + 4 bytes + 24 bytes
-            gameEvent.IsMedal = isMedal;
+                if (typeHint != null)
+                {
+                    gameEvent.TypeHint = typeHint;
 
-            // Extract the medal type (1 byte)
-            byte medalType = ExtractBitsFromPosition(data, 32 * 8 + 120 * 8 + 8 + 4 * 8 + 24 * 8 + 8, 1 * 8)[0]; // 120 bytes + 1 byte + 4 bytes + 24 bytes + 8 bytes
-            gameEvent.MedalType = medalType;
+                    // Extract the timestamp (4 bytes)
+                    byte[] timestampBytes = ExtractBitsFromPosition(data, 32 * 8 + 15 * 8 + 8, 4 * 8);
 
-            return gameEvent;
+                    if (timestampBytes != null)
+                    {
+                        Array.Reverse(timestampBytes);
+                        gameEvent.Timestamp = BitConverter.ToUInt32(timestampBytes, 0);
+
+                        // Extract the is medal (1 byte)
+                        byte isMedal = ExtractBitsFromPosition(data, 32 * 8 + 15 * 8 + 8 + 4 * 8 + 3 * 8, 8)[0];
+                        gameEvent.IsMedal = isMedal;
+
+                        // Extract the medal type (1 byte)
+                        byte medalType = ExtractBitsFromPosition(data, 32 * 8 + 15 * 8 + 8 + 4 * 8 + 3 * 8 + 8 + 3 * 8, 8)[0];
+                        gameEvent.MedalType = medalType;
+
+                        return gameEvent;
+                    }
+                    else
+                    {
+                        Console.WriteLine("[ERROR] Timestamp bytes are null when parsing event.");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[ERROR] Type hint bytes are null when parsing event.");
+                }
+            }
+            else
+            {
+                Console.WriteLine("[ERROR] Gamertag bytes are null when parsing event.");
+            }
+
+            return null;
         }
     }
 }
