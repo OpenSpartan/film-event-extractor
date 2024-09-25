@@ -13,6 +13,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 
 namespace OpenSpartan.FilmEventExtractor
 {
@@ -26,6 +27,9 @@ namespace OpenSpartan.FilmEventExtractor
         internal static readonly string ApplicationVersion = "0.0.1-09172024";
         internal static readonly string DataConnectionString = @"Data Source=eventlog.db;";
         internal static readonly string LogFileName = "log.txt";
+        internal static readonly string ExclusionFileName = "excludedmatchids.json";
+
+        internal static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
         internal static readonly byte[] PlayerIdentificationPattern = { 0x2D, 0xC0 };
 
@@ -48,16 +52,27 @@ namespace OpenSpartan.FilmEventExtractor
                 Console.WriteLine("Authentication successful.");
 
                 var matchIds = await GetPlayerMatchIds(XboxUserContext.DisplayClaims.Xui[0].XUID);
+                Console.WriteLine($"Obtained {matchIds.Count} match IDs for the current player.");
 
                 // Prepare the database.
                 SetWALJournalingMode();
 
-                using SqliteConnection connection = new SqliteConnection(DataConnectionString);
+                using SqliteConnection connection = new(DataConnectionString);
                 connection.Open();
 
                 if (matchIds != null && matchIds.Count > 0)
                 {
-                    // We have matches - let's get the films for each.
+                    // We have matches. Let's try and validate what we have against what's already in
+                    // the database and the exceptions file.
+                    var existingMatches = GetExistingMatchIds(connection);
+
+                    if (existingMatches != null && existingMatches.Count > 0)
+                    {
+                        Console.WriteLine($"There are {existingMatches.Count} match IDs already registered in the database.");
+
+                        CleanMatchIdList(matchIds, existingMatches);
+                    }
+
                     foreach (var matchId in matchIds)
                     {
                         Console.WriteLine($"Processing match {matchIds.IndexOf(matchId)} of {matchIds.Count}...");
@@ -70,29 +85,98 @@ namespace OpenSpartan.FilmEventExtractor
                             var playerTagChunks = filmMetadata.Result.CustomData.Chunks.Where(x => x.ChunkType != 3);
 
                             // General metadata chunk always has chunk type of 3.
-                            var generalMetadataChunk = filmMetadata.Result.CustomData.Chunks.First(x => x.ChunkType == 3);
+                            var generalMetadataChunk = filmMetadata.Result.CustomData.Chunks.FirstOrDefault(x => x.ChunkType == 3);
 
-                            if (playerTagChunks != null && generalMetadataChunk != null)
+                            if (generalMetadataChunk != null)
                             {
-                                Dictionary<long, string> metaPlayerCollection = [];
-
-                                foreach (var playerTagChunk in playerTagChunks)
+                                if (playerTagChunks != null && generalMetadataChunk != null)
                                 {
-                                    Console.WriteLine($"Processing {playerTagChunk.FileRelativePath} for {matchId}...");
+                                    Dictionary<long, string> metaPlayerCollection = [];
 
-                                    var url = $"{filmMetadata.Result.BlobStoragePathPrefix}{playerTagChunk.FileRelativePath.Replace("/", string.Empty)}";
-                                    Console.WriteLine($"Downloading film chunk from {url}");
-
-                                    var compressedPlayerData = await DownloadFilm(url);
-                                    if (compressedPlayerData != null)
+                                    foreach (var playerTagChunk in playerTagChunks)
                                     {
-                                        var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
+                                        Console.WriteLine($"Processing {playerTagChunk.FileRelativePath} for {matchId}...");
 
-                                        var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
+                                        var url = $"{filmMetadata.Result.BlobStoragePathPrefix}{playerTagChunk.FileRelativePath.Replace("/", string.Empty)}";
+                                        Console.WriteLine($"Downloading film chunk from {url}");
 
-                                        foreach (var player in players)
+                                        try
                                         {
-                                            metaPlayerCollection.TryAdd(player.Key, player.Value);
+                                            var compressedPlayerData = await DownloadFilm(url);
+                                            if (compressedPlayerData != null)
+                                            {
+                                                var uncompressedPlayerData = UncompressZlib(compressedPlayerData);
+
+                                                var players = ProcessFilmBootstrapData(uncompressedPlayerData, PlayerIdentificationPattern);
+
+                                                foreach (var player in players)
+                                                {
+                                                    metaPlayerCollection.TryAdd(player.Key, player.Value);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                Console.WriteLine("Content is null.");
+                                            }
+                                        }
+                                        catch (FileNotFoundException e)
+                                        {
+                                            // We hit a 404.
+                                            ExcludeMatchId(matchId);
+                                        }
+                                    }
+
+                                    Console.WriteLine("Finished processing individual starter chunks. Identified players:");
+                                    foreach (var player in metaPlayerCollection)
+                                    {
+                                        Console.WriteLine($"{player.Value} ({player.Key})");
+                                    }
+
+                                    var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
+
+                                    if (compressedMetadata != null)
+                                    {
+                                        var uncompressedMetadata = UncompressZlib(compressedMetadata);
+
+                                        foreach (var player in metaPlayerCollection)
+                                        {
+                                            Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", Encoding.Unicode.GetBytes(player.Value).Select(b => b.ToString("X2")))})...");
+                                            var data = ProcessFilmTimelineData(uncompressedMetadata, Encoding.Unicode.GetBytes(player.Value));
+
+                                            if (data != null && data.Count > 0)
+                                            {
+                                                string query = @"INSERT INTO EventLog (EventID, MatchID, Gamertag, XUID, EventType, MedalFlag, EventTime, MetadataValue)
+                                                             VALUES (@EventID, @MatchID, @Gamertag, @XUID, @EventType, @MedalFlag, @EventTime, @MetadataValue)";
+
+                                                foreach (var gameEvent in data)
+                                                {
+                                                    // Create a command object
+                                                    using SqliteCommand command = new(query, connection);
+                                                    // Add parameters to the query
+                                                    command.Parameters.AddWithValue("@EventID", Guid.NewGuid().ToString());         // Event ID (Primary Key)
+                                                    command.Parameters.AddWithValue("@MatchID", matchId);         // Match ID
+                                                    command.Parameters.AddWithValue("@Gamertag", gameEvent.Gamertag);       // Gamertag
+                                                    command.Parameters.AddWithValue("@XUID", player.Key);    // XUID
+                                                    command.Parameters.AddWithValue("@EventType", gameEvent.TypeHint);           // Event Type
+                                                    command.Parameters.AddWithValue("@MedalFlag", gameEvent.IsMedal);                // Medal Flag (Integer)
+                                                    command.Parameters.AddWithValue("@EventTime", gameEvent.Timestamp);       // Event Time (Unix timestamp)
+                                                    command.Parameters.AddWithValue("@MetadataValue", gameEvent.MedalType);  // Optional Metadata Value
+
+                                                    try
+                                                    {
+                                                        // Execute the command
+                                                        int result = command.ExecuteNonQuery();
+
+                                                        // Output the result
+                                                        Console.WriteLine($"{result} row(s) inserted into database.");
+                                                    }
+                                                    catch (Exception ex)
+                                                    {
+                                                        Console.WriteLine("Could not insert data into database.");
+                                                        Console.WriteLine(ex.ToString());
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     else
@@ -100,69 +184,15 @@ namespace OpenSpartan.FilmEventExtractor
                                         Console.WriteLine("Content is null.");
                                     }
                                 }
-
-                                Console.WriteLine("Finished processing individual starter chunks. Identified players:");
-                                foreach (var player in metaPlayerCollection)
-                                {
-                                    Console.WriteLine($"{player.Value} ({player.Key})");
-                                }
-
-                                var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
-
-                                if (compressedMetadata != null)
-                                {
-                                    var uncompressedMetadata = UncompressZlib(compressedMetadata);
-
-                                    foreach (var player in metaPlayerCollection)
-                                    {
-                                        Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", Encoding.Unicode.GetBytes(player.Value).Select(b => b.ToString("X2")))})...");
-                                        var data = ProcessFilmTimelineData(uncompressedMetadata, Encoding.Unicode.GetBytes(player.Value));
-
-                                        if (data != null && data.Count > 0)
-                                        {
-                                            string query = @"INSERT INTO EventLog (EventID, MatchID, Gamertag, XUID, EventType, MedalFlag, EventTime, MetadataValue)
-                                                             VALUES (@EventID, @MatchID, @Gamertag, @XUID, @EventType, @MedalFlag, @EventTime, @MetadataValue)";
-
-                                            foreach (var gameEvent in data)
-                                            {
-                                                // Create a command object
-                                                using SqliteCommand command = new(query, connection);
-                                                // Add parameters to the query
-                                                command.Parameters.AddWithValue("@EventID", Guid.NewGuid().ToString());         // Event ID (Primary Key)
-                                                command.Parameters.AddWithValue("@MatchID", matchId);         // Match ID
-                                                command.Parameters.AddWithValue("@Gamertag", gameEvent.Gamertag);       // Gamertag
-                                                command.Parameters.AddWithValue("@XUID", player.Key);    // XUID
-                                                command.Parameters.AddWithValue("@EventType", gameEvent.TypeHint);           // Event Type
-                                                command.Parameters.AddWithValue("@MedalFlag", gameEvent.IsMedal);                // Medal Flag (Integer)
-                                                command.Parameters.AddWithValue("@EventTime", gameEvent.Timestamp);       // Event Time (Unix timestamp)
-                                                command.Parameters.AddWithValue("@MetadataValue", gameEvent.MedalType);  // Optional Metadata Value
-
-                                                try
-                                                {
-                                                    // Execute the command
-                                                    int result = command.ExecuteNonQuery();
-
-                                                    // Output the result
-                                                    Console.WriteLine($"{result} row(s) inserted into database.");
-                                                }
-                                                catch (Exception ex)
-                                                {
-                                                    Console.WriteLine("Could not insert data into database.");
-                                                    Console.WriteLine(ex.ToString());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                                 else
                                 {
-                                    Console.WriteLine("Content is null.");
+                                    Console.WriteLine($"Could not get film metadata for match {matchId}");
                                 }
                             }
-                            else
-                            {
-                                Console.WriteLine($"Could not get film metadata for match {matchId}");
-                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Match {matchId} had no metadata chunk of type 3. Cannot process full timeline.");
                         }
                     }
                 }
@@ -172,6 +202,69 @@ namespace OpenSpartan.FilmEventExtractor
                 // Authentication was not successful.
                 Console.WriteLine("Could not authenticate the user.");
             }
+        }
+
+        public static void ExcludeMatchId(Guid matchId)
+        {
+            List<Guid> excludedMatchIds;
+
+            if (System.IO.File.Exists(ExclusionFileName))
+            {
+                var jsonContent = System.IO.File.ReadAllText(ExclusionFileName);
+                excludedMatchIds = JsonSerializer.Deserialize<List<Guid>>(jsonContent) ?? [];
+            }
+            else
+            {
+                excludedMatchIds = [];
+            }
+
+            if (!excludedMatchIds.Contains(matchId))
+            {
+                excludedMatchIds.Add(matchId);
+
+                var updatedJson = JsonSerializer.Serialize(excludedMatchIds, options: JsonOptions);
+                System.IO.File.WriteAllText(ExclusionFileName, updatedJson);
+
+                Console.WriteLine($"Match ID {matchId} has been added to the banned list.");
+            }
+            else
+            {
+                Console.WriteLine($"Match ID {matchId} is already banned.");
+            }
+        }
+
+        public static void CleanMatchIdList(List<Guid> guidList, List<string> matchIDs)
+        {
+            List<Guid> matchGuids = [];
+
+            foreach (string matchID in matchIDs)
+            {
+                if (Guid.TryParse(matchID, out Guid matchGuid))
+                {
+                    matchGuids.Add(matchGuid);
+                }
+            }
+
+            guidList.RemoveAll(g => matchGuids.Contains(g));
+        }
+
+        public static List<string> GetExistingMatchIds(SqliteConnection connection)
+        {
+            List<string> matchIDs = [];
+
+            string query = "SELECT DISTINCT MatchID FROM EventLog";
+
+            using (SqliteCommand command = new(query, connection))
+            {
+                using SqliteDataReader reader = command.ExecuteReader();
+
+                while (reader.Read())
+                {
+                    matchIDs.Add(reader["MatchID"].ToString());
+                }
+            }
+
+            return matchIDs;
         }
 
         static void InitializeLogging()
@@ -240,30 +333,37 @@ namespace OpenSpartan.FilmEventExtractor
             }
             catch (HttpRequestException e) when (e.StatusCode != HttpStatusCode.OK)
             {
-                // Handle cases where the request is not successful. At this point, we're not super-picky
-                // Let's just re-initialize the application and try to get the data again.
-                Console.WriteLine($"Unauthorized request for {filmPath}: {e.Message}. Initializing application...");
-                bool appState = await InitializeApplication(); // Call your initialization function
-
-                if (appState)
+                if (e.StatusCode != HttpStatusCode.NotFound)
                 {
-                    // Retry the download
-                    try
+                    // Handle cases where the request is not successful. At this point, we're not super-picky
+                    // Let's just re-initialize the application and try to get the data again.
+                    Console.WriteLine($"Unauthorized request for {filmPath}: {e.Message}. Initializing application...");
+                    bool appState = await InitializeApplication(); // Call your initialization function
+
+                    if (appState)
                     {
-                        byte[] data = await client.GetByteArrayAsync(filmPath);
-                        Console.WriteLine($"Downloaded {data.Length} chunk bytes successfully for {filmPath} after reinitialization.");
-                        return data;
+                        // Retry the download
+                        try
+                        {
+                            byte[] data = await client.GetByteArrayAsync(filmPath);
+                            Console.WriteLine($"Downloaded {data.Length} chunk bytes successfully for {filmPath} after reinitialization.");
+                            return data;
+                        }
+                        catch (HttpRequestException retryException)
+                        {
+                            Console.WriteLine($"Retry failed for {filmPath}: {retryException.Message}");
+                            return null;
+                        }
                     }
-                    catch (HttpRequestException retryException)
+                    else
                     {
-                        Console.WriteLine($"Retry failed for {filmPath}: {retryException.Message}");
+                        Console.WriteLine("Could not re-initialize the application.");
                         return null;
                     }
                 }
                 else
                 {
-                    Console.WriteLine("Could not re-initialize the application.");
-                    return null;
+                    throw new FileNotFoundException("The film chunk file was not found on the server.");
                 }
             }
             catch (HttpRequestException e)
@@ -655,7 +755,9 @@ namespace OpenSpartan.FilmEventExtractor
             int remainingLength = endIndex - startIndex;
             if (remainingLength % 2 != 0)
             {
-                throw new ArgumentException("Byte array length must be even for UTF-16 encoding.");
+                Console.WriteLine("Byte array length must be even for UTF-16 encoding.");
+                Console.WriteLine(byteArray.Select(b => b.ToString("X2")));
+                return string.Empty;
             }
 
             byte[] trimmedBytes = new byte[remainingLength];
@@ -727,8 +829,6 @@ namespace OpenSpartan.FilmEventExtractor
             foreach (int patternPosition in patternPositions)
             {
                 int xuidStartPosition = patternPosition - 8 * 8;
-                Console.WriteLine($"XUID start position: {xuidStartPosition}");
-
                 byte[] xuid = ExtractBitsFromPosition(data, xuidStartPosition, 8 * 8);
 
                 if (xuid != null)
@@ -743,12 +843,13 @@ namespace OpenSpartan.FilmEventExtractor
 
                         if (bytePrefixValidated)
                         {
-                            Console.WriteLine($"Gamertag extraction position: {prePatternPosition - 32 * 8}");
+                            Console.WriteLine($"Detected gamertag extraction position: {prePatternPosition - 32 * 8}");
                             byte[] gamertagData = ExtractBitsFromPosition(data, prePatternPosition - 32 * 8, 32 * 8);
 
                             if (gamertagData != null)
                             {
                                 var gamertag = ConvertBytesToText(gamertagData);
+                                Console.WriteLine($"Gamertag: {gamertag}");
 
                                 if (gamertag != null && !string.IsNullOrWhiteSpace(gamertag))
                                 {
