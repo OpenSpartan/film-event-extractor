@@ -73,6 +73,14 @@ namespace OpenSpartan.FilmEventExtractor
                         CleanMatchIdList(matchIds, existingMatches);
                     }
 
+                    var excludedMatches = GetExcludedMatches();
+                    if (excludedMatches != null && excludedMatches.Count > 0)
+                    {
+                        Console.WriteLine($"Found {excludedMatches.Count} matches that need to be excluded.");
+
+                        CleanMatchIdList(matchIds, excludedMatches);
+                    }
+
                     foreach (var matchId in matchIds)
                     {
                         Console.WriteLine($"Processing match {matchIds.IndexOf(matchId)} of {matchIds.Count}...");
@@ -92,6 +100,8 @@ namespace OpenSpartan.FilmEventExtractor
                                 if (playerTagChunks != null && generalMetadataChunk != null)
                                 {
                                     Dictionary<long, string> metaPlayerCollection = [];
+
+                                    bool playerChunksMissing = false;
 
                                     foreach (var playerTagChunk in playerTagChunks)
                                     {
@@ -123,65 +133,75 @@ namespace OpenSpartan.FilmEventExtractor
                                         {
                                             // We hit a 404.
                                             ExcludeMatchId(matchId);
+                                            playerChunksMissing = true;
+                                            break;
                                         }
                                     }
 
-                                    Console.WriteLine("Finished processing individual starter chunks. Identified players:");
-                                    foreach (var player in metaPlayerCollection)
+                                    if (!playerChunksMissing)
                                     {
-                                        Console.WriteLine($"{player.Value} ({player.Key})");
-                                    }
-
-                                    var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
-
-                                    if (compressedMetadata != null)
-                                    {
-                                        var uncompressedMetadata = UncompressZlib(compressedMetadata);
-
+                                        Console.WriteLine("Finished processing individual starter chunks. Identified players:");
                                         foreach (var player in metaPlayerCollection)
                                         {
-                                            Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", Encoding.Unicode.GetBytes(player.Value).Select(b => b.ToString("X2")))})...");
-                                            var data = ProcessFilmTimelineData(uncompressedMetadata, Encoding.Unicode.GetBytes(player.Value));
+                                            Console.WriteLine($"{player.Value} ({player.Key})");
+                                        }
 
-                                            if (data != null && data.Count > 0)
+                                        var compressedMetadata = await DownloadFilm($"{filmMetadata.Result.BlobStoragePathPrefix}{generalMetadataChunk.FileRelativePath.Replace("/", string.Empty)}");
+
+                                        if (compressedMetadata != null)
+                                        {
+                                            var uncompressedMetadata = UncompressZlib(compressedMetadata);
+
+                                            foreach (var player in metaPlayerCollection)
                                             {
-                                                string query = @"INSERT INTO EventLog (EventID, MatchID, Gamertag, XUID, EventType, MedalFlag, EventTime, MetadataValue)
+                                                Console.WriteLine($"Searching for events for {player.Value} ({string.Join(" ", Encoding.Unicode.GetBytes(player.Value).Select(b => b.ToString("X2")))})...");
+                                                var data = ProcessFilmTimelineData(uncompressedMetadata, Encoding.Unicode.GetBytes(player.Value));
+
+                                                if (data != null && data.Count > 0)
+                                                {
+                                                    string query = @"INSERT INTO EventLog (EventID, MatchID, Gamertag, XUID, EventType, MedalFlag, EventTime, MetadataValue)
                                                              VALUES (@EventID, @MatchID, @Gamertag, @XUID, @EventType, @MedalFlag, @EventTime, @MetadataValue)";
 
-                                                foreach (var gameEvent in data)
-                                                {
-                                                    // Create a command object
-                                                    using SqliteCommand command = new(query, connection);
-                                                    // Add parameters to the query
-                                                    command.Parameters.AddWithValue("@EventID", Guid.NewGuid().ToString());         // Event ID (Primary Key)
-                                                    command.Parameters.AddWithValue("@MatchID", matchId);         // Match ID
-                                                    command.Parameters.AddWithValue("@Gamertag", gameEvent.Gamertag);       // Gamertag
-                                                    command.Parameters.AddWithValue("@XUID", player.Key);    // XUID
-                                                    command.Parameters.AddWithValue("@EventType", gameEvent.TypeHint);           // Event Type
-                                                    command.Parameters.AddWithValue("@MedalFlag", gameEvent.IsMedal);                // Medal Flag (Integer)
-                                                    command.Parameters.AddWithValue("@EventTime", gameEvent.Timestamp);       // Event Time (Unix timestamp)
-                                                    command.Parameters.AddWithValue("@MetadataValue", gameEvent.MedalType);  // Optional Metadata Value
-
-                                                    try
+                                                    foreach (var gameEvent in data)
                                                     {
-                                                        // Execute the command
-                                                        int result = command.ExecuteNonQuery();
+                                                        // Create a command object
+                                                        using SqliteCommand command = new(query, connection);
+                                                        // Add parameters to the query
+                                                        command.Parameters.AddWithValue("@EventID", Guid.NewGuid().ToString());         // Event ID (Primary Key)
+                                                        command.Parameters.AddWithValue("@MatchID", matchId);         // Match ID
+                                                        command.Parameters.AddWithValue("@Gamertag", gameEvent.Gamertag);       // Gamertag
+                                                        command.Parameters.AddWithValue("@XUID", player.Key);    // XUID
+                                                        command.Parameters.AddWithValue("@EventType", gameEvent.TypeHint);           // Event Type
+                                                        command.Parameters.AddWithValue("@MedalFlag", gameEvent.IsMedal);                // Medal Flag (Integer)
+                                                        command.Parameters.AddWithValue("@EventTime", gameEvent.Timestamp);       // Event Time (Unix timestamp)
+                                                        command.Parameters.AddWithValue("@MetadataValue", gameEvent.MedalType);  // Optional Metadata Value
 
-                                                        // Output the result
-                                                        Console.WriteLine($"{result} row(s) inserted into database.");
-                                                    }
-                                                    catch (Exception ex)
-                                                    {
-                                                        Console.WriteLine("Could not insert data into database.");
-                                                        Console.WriteLine(ex.ToString());
+                                                        try
+                                                        {
+                                                            // Execute the command
+                                                            int result = command.ExecuteNonQuery();
+
+                                                            // Output the result
+                                                            Console.WriteLine($"{result} row(s) inserted into database.");
+                                                        }
+                                                        catch (Exception ex)
+                                                        {
+                                                            Console.WriteLine("Could not insert data into database.");
+                                                            Console.WriteLine(ex.ToString());
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                        else
+                                        {
+                                            Console.WriteLine("Content is null.");
+                                        }
                                     }
                                     else
                                     {
-                                        Console.WriteLine("Content is null.");
+                                        Console.WriteLine("Interrupting processing. Player chunks are missing, so we can't fully complete the parsing.");
+                                        continue;
                                     }
                                 }
                                 else
@@ -193,6 +213,7 @@ namespace OpenSpartan.FilmEventExtractor
                         else
                         {
                             Console.WriteLine($"Match {matchId} had no metadata chunk of type 3. Cannot process full timeline.");
+                            ExcludeMatchId(matchId);
                         }
                     }
                 }
@@ -201,6 +222,19 @@ namespace OpenSpartan.FilmEventExtractor
             {
                 // Authentication was not successful.
                 Console.WriteLine("Could not authenticate the user.");
+            }
+        }
+
+        private static List<string> GetExcludedMatches()
+        {
+            if (System.IO.File.Exists(ExclusionFileName))
+            {
+                var jsonContent = System.IO.File.ReadAllText(ExclusionFileName);
+                return JsonSerializer.Deserialize<List<string>>(jsonContent) ?? [];
+            }
+            else
+            {
+                return [];
             }
         }
 
